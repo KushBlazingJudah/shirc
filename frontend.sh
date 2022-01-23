@@ -1,7 +1,14 @@
 #!/bin/sh -e
 
-BUFFER="#test"
-BUFFILE="buffers/#test/messages"
+# PoC frontend in POSIX sh.
+# Uses even more dirty hacks, performs terribly even on a modern system.
+# Probably could be improved but it's a proof of concept.
+#
+# If I ever say I'm writing a graphical application in shell again, please hit me with a brick.
+# Also word wrapping is awful. I don't want to do that again.
+
+BUFFER=${BUFFER?no buffer}
+BUFFILE="buffers/$BUFFER/messages"
 NICKNAME="${NICKNAME:-$(whoami)}"
 CONTROL="./control"
 
@@ -27,15 +34,17 @@ CTRLC="$(printf "\003")"
 CR="$(printf '\015')"
 C1="$(printf '\001')"
 
-NOACT=0
+ACT=0
 
+# ^A hack: prevents read from stripping spaces
+WRAPPREFIX="                  "
 MSGFMT="%9s | %s${ESC}[0m"
 NOTICEFMT="${ESC}[7m%9s${ESC}[0m | %s${ESC}[0m"
 ACTIONFMT="%9s ${ESC}[3m%s${ESC}[0m"
-JOINFMT="            --> %s joined"
-PARTFMT="            <-- %s left"
-PARTREASONFMT="            <-- %s left: %s"
-QUITFMT="            <-- %s quit: %s"
+JOINFMT="            ${ESC}[3;32m--> ${ESC}[0;1m%s${ESC}[0;3m joined${ESC}[0m"
+PARTFMT="            ${ESC}[3;31m<-- ${ESC}[0;1m%s${ESC}[0;3m left${ESC}[0m"
+PARTREASONFMT="            ${ESC}[3;31m<-- ${ESC}[0;1m%s${ESC}[0;3m left: %s${ESC}[0m"
+QUITFMT="            ${ESC}[3;31m<-- ${ESC}[0;1m%s${ESC}[0;3m quit: %s${ESC}[0m"
 
 # Get a nickname from a prefix.
 prefix_get_nick() {
@@ -56,6 +65,7 @@ timehhmm() {
 }
 
 sendmsg() {
+	ACT=0
 	echo "PRIVMSG $BUFFER :$LINEIN" > "$CONTROL"
 	echo ":$NICKNAME!.@. PRIVMSG $BUFFER :$LINEIN" >> "$BUFFILE"
 }
@@ -66,14 +76,14 @@ read_input() {
 		# check for activity in the buffer
 		mod="$(stat --printf=%Y "$BUFFILE")"
 		if [ "$mod" -ne "$BUFLAST" ]; then
-			NOACT=0
+			ACT=3 # redraw buffer
 			return
 		fi
 
-		NOACT=1
+		ACT=1 # draw nothing
 		return
 	else
-		NOACT=0
+		ACT=2 # draw input
 	fi
 
 	if [ "$inp" = "$CTRLC" ]; then
@@ -121,6 +131,21 @@ read_input() {
 			LINEPOS=$((LINEPOS+1))
 			;;
 	esac
+}
+
+linewrap() {
+	# NOTE: WRAPPREFIX contains unprintable characters.
+	# that's why we subtract one
+	wrapat=$((COLS-${#WRAPPREFIX}-1))
+	while read -r line; do
+		# this is horribly ugly and most likely won't work with control chars
+		printf '%s\n' "$(printf '%s' "$line" | cut -c -"$COLS")"
+
+		printf '%s\n' "$line" | cut -c $((COLS+1))- | fold -s -w "$wrapat" | while read -r linef; do
+			if [ -z "$linef" ]; then continue; fi
+			printf '%s%s\n' "$WRAPPREFIX" "$linef"
+		done
+	done
 }
 
 read_escape() {
@@ -246,16 +271,19 @@ draw_buffer() {
 	# scrollback shouldn't be too terrible to implement if you want to try
 	BUFLAST="$(stat --printf=%Y "$BUFFILE")"
 
-	count=$((ROWS-1))
-	tac "$BUFFILE" | format_lines | while read -r _line; do
-		if [ "$count" -le 0 ]; then
-			break
-		fi
-
+	# this is godawful but works
+	# we will never need more than ROWS-1 rows, as if none of those wrap we will be displaying ROWS-1 lines
+	# we tail again because we won't ever display more than ROWS-1 lines, and we may have more if some lines wrapped
+	count=1
+	tail -n "$((ROWS-1))" "$BUFFILE" | format_lines | linewrap | tail -n "$((ROWS-1))" | while read -r _line; do
 		# set line and clear line
 		printf "${ESC}[${count};0H${ESC}[2K"
 		printf "%s" "$_line"
-		count=$((count-1))
+
+		count=$((count+1))
+		if [ "$count" -gt $((ROWS)) ]; then
+			break
+		fi
 	done
 }
 
@@ -279,11 +307,24 @@ ROWS="${_size% *}"
 COLS="${_size#* }"
 
 while true; do
-	if [ "$NOACT" -ne 1 ]; then
-		# Redraw only when necessary
+	if [ "$ACT" -eq 0 ]; then
+		# Full redraw
 		hide_cursor
 		draw_buffer
 		draw_input
+		show_cursor
+		# 1 is no draw
+	elif [ "$ACT" -eq 2 ]; then
+		# 2 is just input
+		hide_cursor
+		draw_input
+		show_cursor
+	elif [ "$ACT" -eq 3 ]; then
+		# 3 is just buffer
+		printf "${ESC}[s" # save cursor
+		hide_cursor
+		draw_buffer
+		printf "${ESC}[u" # restore cursor
 		show_cursor
 	fi
 
