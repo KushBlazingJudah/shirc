@@ -73,12 +73,19 @@ exec 3<>"$FIFO" # open for reading/writing
 mkdir "$BUFFERS"
 
 cleanup() {
+	[ -n "$cleaned" ] && return 1
+
+	echo "QUIT" >&3 || true
+
 	rm -r "$BUFFERS"
-	exec 3>-
+
+	exec 3<&- # close control fifo
 	rm "$FIFO"
+	cleaned=1
 }
 
-trap cleanup EXIT
+# run this on exit
+trap cleanup EXIT INT HUP
 
 # Register to IRC
 cat <<EOF >&3
@@ -87,25 +94,25 @@ USER $USERNAME 0 * :$REALNAME
 EOF
 
 open_channel() {
-	mkdir -p "$BUFFERS/channels/$1"
-	:>"$BUFFERS/channels/$1/users"
-	:>"$BUFFERS/channels/$1/messages"
+	mkdir -p "$BUFFERS/$1"
+	:>"$BUFFERS/$1/users"
+	:>"$BUFFERS/$1/messages"
 }
 
 close_channel() {
-	rm -r "$BUFFERS/channels/$1"
+	rm -r "$BUFFERS/$1"
 }
 
 channel_join() {
 	# HACK
-	printf "%s\n" "$2" | cat "$BUFFERS/channels/$1/users" - | sort | uniq > "$BUFFERS/channels/$1/_users"
-	cat "$BUFFERS/channels/$1/_users" > "$BUFFERS/channels/$1/users"
-	rm "$BUFFERS/channels/$1/_users"
+	printf "%s\n" "$2" | cat "$BUFFERS/$1/users" - | sort | uniq > "$BUFFERS/$1/_users"
+	cat "$BUFFERS/$1/_users" > "$BUFFERS/$1/users"
+	rm "$BUFFERS/$1/_users"
 }
 
 channel_leave() {
 	# HACK
-	sed -i "/$2/d" "$BUFFERS/channels/$1/users"
+	sed -i "/$2/d" "$BUFFERS/$1/users"
 }
 
 privmsg() {
@@ -113,8 +120,8 @@ privmsg() {
 }
 
 channel_msg() {
-	if [ -d "$BUFFERS/channels/$1" ]; then
-		printf '%s\n' "$2" >> "$BUFFERS/channels/$1/messages"
+	if [ -d "$BUFFERS/$1" ]; then
+		printf '%s\n' "$2" >> "$BUFFERS/$1/messages"
 	fi
 }
 
@@ -169,7 +176,7 @@ $CONNCMD <&3 | while read -r line; do
 		PART)
 			nick="$(prefix_get_nick "$prefix")"
 			if [ "$nick" = "$NICKNAME" ]; then
-				close_channel "$trailing"
+				close_channel "${args%% *}"
 			else
 				channel_leave "${args%% *}" "$nick"
 				channel_msg "${args%% *}" "$line"
@@ -188,9 +195,14 @@ $CONNCMD <&3 | while read -r line; do
 			;;
 		QUIT)
 			nick="$(prefix_get_nick "$prefix")"
-			for channel in "$BUFFERS/channels/"*; do
-				channel_leave "$channel" "$nick"
-				channel_msg "$channel" "$line"
+			for channel in "$BUFFERS/"*; do
+				if [ ! -d "$channel" ]; then
+					continue
+				fi
+
+				c="$(basename "$channel")"
+				channel_leave "$c" "$nick"
+				channel_msg "$c" "$line"
 			done
 			;;
 		PRIVMSG|NOTICE)
@@ -219,6 +231,9 @@ $CONNCMD <&3 | while read -r line; do
 			;;
 		PING)
 			printf 'PONG %s\r\n' "$tokens" >&3
+			;;
+		366)
+			# consume this
 			;;
 		*)
 			printf '%s\n' "$line"
